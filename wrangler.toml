@@ -1,0 +1,29 @@
+# ──────────────────────────────────────────────
+# 作业提交系统 · Cloudflare Workers 配置
+# ──────────────────────────────────────────────
+# 敏感凭证（ADMIN_PASS / UPLOAD_SECRET）请用
+#   wrangler secret put <NAME>
+# 命令设置，不要写在本文件里。
+# ──────────────────────────────────────────────
+
+name = "homework"
+main = "worker.js"
+compatibility_date = "2024-06-01"
+
+# ── 非敏感的应用变量（明写可接受） ──────────
+[vars]
+ADMIN_USER = "admin"
+
+# ── KV Namespace：运行时状态存储 ───────────
+[[kv_namespaces]]
+binding = "GROUP_KV"
+id = "..."
+
+# ── Durable Object：同组提交串行化 ─────────
+[[durable_objects.bindings]]
+name = "GROUP_DO"
+class_name = "GroupDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GroupDO"]
