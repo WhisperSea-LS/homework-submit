@@ -9,6 +9,17 @@ export class GroupDO {
     if (action !== "commit") return new Response("Unknown DO action", { status: 400 });
 
     return this.state.blockConcurrencyWhile(async () => {
+      // 一次性临时凭证：和提交记录放在同一个串行区内核销，保证只能用一次
+      const grant = payload.grant ? String(payload.grant).trim() : "";
+      let grantRecord = null;
+      if (grant) {
+        const raw = await this.env.GROUP_KV.get("grant:" + grant);
+        try { grantRecord = raw ? JSON.parse(raw) : null; } catch (_) {}
+        if (!grantRecord || grantRecord.used) {
+          return Response.json({ ok: false, reason: "临时凭证无效或已被使用" });
+        }
+      }
+
       const nonce = payload.claims && payload.claims.nonce;
       if (nonce) {
         if (await this.state.storage.get("nonce:" + nonce)) {
@@ -40,6 +51,15 @@ export class GroupDO {
         await this.env.GROUP_KV.put(`sid:${sid}`, group);
       }
       if (nonce) await this.state.storage.put("nonce:" + nonce, Date.now());
+      if (grant) {
+        await this.env.GROUP_KV.put("grant:" + grant, JSON.stringify({
+          created: grantRecord.created || Date.now(),
+          note: grantRecord.note || "",
+          used: true,
+          usedAt: Date.now(),
+          usedBy: group
+        }));
+      }
       return Response.json({ ok: true });
     });
   }
@@ -215,11 +235,41 @@ async function deleteStorageObject(store, key) {
   if (client) await client.deleteObject(key).catch(() => {});
 }
 
-async function assertSubmissionOpen(env) {
+function normalizeGrant(s) {
+  return String(s == null ? "" : s).trim().toLowerCase();
+}
+
+async function getGrant(env, id) {
+  if (!id) return null;
+  const raw = await env.GROUP_KV.get("grant:" + id);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (_) { return null; }
+}
+
+async function listGrants(env) {
+  const out = [];
+  let cursor = null;
+  for (;;) {
+    const opts = { prefix: "grant:" };
+    if (cursor) opts.cursor = cursor;
+    const page = await env.GROUP_KV.list(opts);
+    for (const k of page.keys) {
+      let meta = {};
+      try { meta = JSON.parse(await env.GROUP_KV.get(k.name) || "{}"); } catch (_) {}
+      out.push({ id: k.name.slice("grant:".length), ...meta });
+    }
+    if (page.list_complete || !page.cursor) break;
+    cursor = page.cursor;
+  }
+  return out.sort((a, b) => (b.created || 0) - (a.created || 0));
+}
+
+// 临时凭证只绕过「截止时间」；管理员手动关闭提交仍一律拒绝
+async function assertSubmissionOpen(env, hasGrant) {
   const cfg = await getConfig(env);
   if (!cfg.submissionOpen) return "当前已关闭提交";
   const deadline = await getDeadline(env);
-  if (deadline !== null && Date.now() >= deadline) return "提交已截止";
+  if (hasGrant !== true && deadline !== null && Date.now() >= deadline) return "提交已截止";
   return null;
 }
 
@@ -975,18 +1025,20 @@ const indexHtml = `<!DOCTYPE html>
 <h1>📤 作业提交</h1>
 <p class="lede">填写小组与学号，选择文件即可完成提交。</p>
 </header>
-<div id="closedTip" class="glass notice notice-warn" style="display:none">⏰ <b>提交已截止</b>，提交入口已关闭。如有特殊情况请联系管理员。</div>
+<div id="closedTip" class="glass notice notice-warn" style="display:none">⏰ <b>提交已截止</b>。如有老师给的临时凭证，在下方验证后可补交一次。</div>
 <section class="glass card"><div id="box"></div></section>
 <section class="glass card">
 <div class="section-head"><h2>📋 提交情况</h2><span class="pill">实时</span></div>
 <div id="status"></div>
 </section>
 <footer class="foot">简洁提交 · 安全存储</footer>
+<footer class="foot">该系统全量开源：https://github.com/WhisperSea-LS/homework-submit</footer>
 </main>
 <script>
 let CFG = null;
 let STORAGE = null;
 let deadlinePassed = false;
+let GRANT_OK = "";
 const typeLabels = {video:"视频",audio:"音频",image:"图片",ppt:"PPT",doc:"其他文档"};
 const acceptMap = {
   video:"video/*", audio:"audio/*", image:"image/*",
@@ -1010,18 +1062,48 @@ async function init() {
   render();
   loadStatus();
 }
+function renderGrantGate(box) {
+  box.innerHTML =
+    '<h3>🔑 临时提交凭证</h3>' +
+    '<p class="lede" style="font-size:13px;margin:0 0 14px">提交已截止。如果老师给了临时凭证，输入并验证后即可补交一次；凭证在提交成功后自动作废。</p>' +
+    '<p><input id="grantInput" placeholder="粘贴临时凭证" autocomplete="off" spellcheck="false" style="width:100%"></p>' +
+    '<button type="button" class="btn btn-primary btn-block" onclick="verifyGrant()">验证凭证</button>' +
+    '<p id="grantMsg" class="msg"></p>';
+}
+async function verifyGrant() {
+  var el = document.getElementById('grantInput');
+  var msg = document.getElementById('grantMsg');
+  var v = el ? el.value.trim() : '';
+  if (!v) { msg.textContent = '请输入凭证'; return; }
+  msg.textContent = '验证中…';
+  try {
+    var r = await fetch('/api/grant-verify', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ grant: v })
+    });
+    if (!r.ok) { msg.textContent = await r.text(); return; }
+    GRANT_OK = v;
+    render();
+  } catch(e) { msg.textContent = '网络错误，请重试'; }
+}
 function render() {
   const box = document.getElementById('box');
-  if (deadlinePassed) {
-    box.style.display = 'none';
+  box.style.display = '';
+  document.getElementById('closedTip').style.display = 'none';
+  if (deadlinePassed && !GRANT_OK) {
     document.getElementById('closedTip').style.display = 'block';
+    renderGrantGate(box);
     return;
   }
   if (!CFG.submissionOpen) {
     box.innerHTML = '<p class="msg err">当前已关闭提交</p>';
     return;
   }
-  let h = '<form id="f">';
+  let h = '';
+  if (GRANT_OK) {
+    h += '<div class="glass notice" style="padding:10px 14px;margin:0 0 14px;font-size:13px;border-color:rgba(21,154,104,.35);color:#128a5d">🔑 临时凭证已验证，本次提交成功后自动作废。</div>';
+  }
+  h += '<form id="f">';
   if (CFG.groupMode) {
     h += '<p>小组名：<input name="group" required placeholder="如：第1组"></p>';
     h += '<p>学号（最多 ' + CFG.groupSize + ' 个）：</p>';
@@ -1161,14 +1243,19 @@ async function doUpload() {
   try {
     var r1 = await fetch('/api/presign', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ group: group, sids: sids, filename: file.name, type: file.type, submitType: submitType })
+      body: JSON.stringify({ group: group, sids: sids, filename: file.name, type: file.type, submitType: submitType, grant: GRANT_OK })
     });
     if (r1.status === 400) {
       var err = null;
       try { err = await r1.json(); } catch (e2) {}
       if (err && err.egg) { location.href = '/egg?from=' + encodeURIComponent(err.from || group); return; }
     }
-    if (!r1.ok) return setMsg(await r1.text());
+    if (!r1.ok) {
+      var why = await r1.text();
+      // 页面打开后管理员才点「立即截止」：就地切到临时凭证入口
+      if (why.indexOf('提交已截止') >= 0) { deadlinePassed = true; render(); return; }
+      return setMsg(why);
+    }
     meta = await r1.json();
   } catch(e) { return setMsg('网络错误，请重试'); }
   try {
@@ -1177,8 +1264,14 @@ async function doUpload() {
     } else {
       await uploadViaProxy(meta.key, meta.token, file);
     }
-    setMsg('✅ 提交成功！');
-    loadStatus();
+    if (GRANT_OK) {
+      GRANT_OK = '';
+      document.getElementById('box').innerHTML = '<p class="msg" style="color:#128a5d">✅ 提交成功，临时凭证已作废。如需再次补交，请联系老师获取新凭证。</p>';
+      loadStatus();
+    } else {
+      setMsg('✅ 提交成功！');
+      loadStatus();
+    }
   } catch(e) { setMsg('上传失败: ' + e.message); }
 }
 async function recordUpload(token, file) {
@@ -1379,6 +1472,7 @@ async function router(req, env, ctx) {
   }
 
   if (url.pathname === "/api/deadline") return handleGetDeadline(req, env);
+  if (url.pathname === "/api/grant-verify") return handleGrantVerify(req, env);
   if (url.pathname === "/api/status") return handleStatus(req, env);
   if (url.pathname === "/api/presign") return handlePresign(req, env);
   if (url.pathname === "/api/upload") return handleUpload(req, env);
@@ -1392,6 +1486,8 @@ async function router(req, env, ctx) {
   if (url.pathname === "/admin/test-storage") return handleTestStorage(req, env);
   if (url.pathname === "/admin/clear-submissions") return handleClearSubmissions(req, env);
   if (url.pathname === "/admin/set-deadline") return handleSetDeadline(req, env);
+  if (url.pathname === "/admin/grant-add") return handleGrantAdd(req, env);
+  if (url.pathname === "/admin/grant-delete") return handleGrantDelete(req, env);
   if (url.pathname === "/admin/edit-members") return handleEditMembers(req, env);
   if (url.pathname.startsWith("/admin/delete/")) return handleDeleteGroup(req, env);
   if (url.pathname.startsWith("/admin/delete-file/")) return handleDeleteFile(req, env);
@@ -1407,12 +1503,11 @@ async function handleUploadProxy(req, env) {
   if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
 
   try {
-    var closed = await assertSubmissionOpen(env);
-    if (closed) return new Response(closed, { status: 403 });
-
     const form = await req.formData();
     const file = form.get("file");
     const claims = await readPayload(env, form.get("token"));
+    var closed = await assertSubmissionOpen(env, !!(claims && claims.grant));
+    if (closed) return new Response(closed, { status: 403 });
     if (!file || !claims || claims.scope !== "upload" || !claims.key) {
       return new Response("上传凭证无效或已过期", { status: 403 });
     }
@@ -1441,6 +1536,41 @@ async function handleGetDeadline(req, env) {
     passed: deadline !== null ? Date.now() >= deadline : false,
                        now: Date.now()
   }, { headers: { "Cache-Control": "no-store" } });
+}
+
+// 只校验、不核销：真正的核销发生在 /api/upload 的 DO 串行区里
+async function handleGrantVerify(req, env) {
+  if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  var cfg = await getConfig(env);
+  if (!cfg.submissionOpen) return new Response("当前已关闭提交", { status: 403 });
+  var body;
+  try { body = await req.json(); } catch (_) { return new Response("请求格式错误", { status: 400 }); }
+  var id = normalizeGrant(body && body.grant);
+  if (!id) return new Response("请输入凭证", { status: 400 });
+  var g = await getGrant(env, id);
+  if (!g || g.used) return new Response("临时凭证无效或已被使用", { status: 403 });
+  return Response.json({ ok: true }, { headers: { "Cache-Control": "no-store" } });
+}
+
+async function handleGrantAdd(req, env) {
+  if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  var fd = await req.formData();
+  if (!await adminOk(req, env, fd.get("token"))) return basicChallenge();
+  var note = String(fd.get("note") || "").trim().slice(0, 60);
+  var id = crypto.randomUUID().toLowerCase();
+  await env.GROUP_KV.put("grant:" + id, JSON.stringify({
+    created: Date.now(), note: note, used: false
+  }));
+  return Response.redirect(new URL(req.url).origin + "/admin#grants", 302);
+}
+
+async function handleGrantDelete(req, env) {
+  if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+  var fd = await req.formData();
+  if (!await adminOk(req, env, fd.get("token"))) return basicChallenge();
+  var id = normalizeGrant(fd.get("id"));
+  if (id) await env.GROUP_KV.delete("grant:" + id);
+  return Response.redirect(new URL(req.url).origin + "/admin#grants", 302);
 }
 
 async function handleStatus(req, env) {
@@ -1484,7 +1614,15 @@ async function handlePresign(req, env) {
   var cfg = await getConfig(env);
   var store = await getStorageConfig(env);
 
-  var closed = await assertSubmissionOpen(env);
+  // 凭证只在「已截止」时生效；未截止的正常提交不会消耗凭证
+  var deadline = await getDeadline(env);
+  var deadlinePassed = deadline !== null && Date.now() >= deadline;
+  var grant = deadlinePassed ? normalizeGrant(body && body.grant) : "";
+  var grantRecord = grant ? await getGrant(env, grant) : null;
+  if (grant && (!grantRecord || grantRecord.used)) {
+    return new Response("临时凭证无效或已被使用", { status: 403 });
+  }
+  var closed = await assertSubmissionOpen(env, !!grantRecord);
   if (closed) return new Response(closed, { status: 403 });
 
   var group = cfg.groupMode ? String(body.group || "").trim() : "personal";
@@ -1543,6 +1681,7 @@ async function handlePresign(req, env) {
     sids: validSids,
     key: key,
     submitType: submitType,
+    grant: grant,
     nonce: crypto.randomUUID(),
     exp: Date.now() + 2 * 3600 * 1000
   };
@@ -1552,14 +1691,13 @@ async function handlePresign(req, env) {
 
 async function handleUpload(req, env) {
   if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-  var closed = await assertSubmissionOpen(env);
-  if (closed) return new Response(closed, { status: 403 });
-
   var body = await req.json();
   var claims = await readPayload(env, body.token);
   if (!claims || claims.scope !== "upload" || !claims.nonce || !claims.key || !Array.isArray(claims.sids)) {
     return new Response("上传凭证无效或已过期", { status: 403 });
   }
+  var closed = await assertSubmissionOpen(env, !!claims.grant);
+  if (closed) return new Response(closed, { status: 403 });
   var originalName = String(body.originalName || claims.key)
   .slice(0, 200)
   .replace(/[\/\\:*?"<>|\r\n]/g, "_");
@@ -1574,6 +1712,7 @@ async function handleUpload(req, env) {
       payload: {
         sids: claims.sids,
         claims: claims,
+        grant: normalizeGrant(claims.grant),
         file: {
           key: claims.key,
           originalName: originalName,
@@ -1593,11 +1732,10 @@ async function handleUpload(req, env) {
 async function handleWebDAVProxy(req, env) {
   try {
     if (req.method !== "PUT") return new Response("Method Not Allowed", { status: 405 });
-    var closed = await assertSubmissionOpen(env);
-    if (closed) return new Response(closed, { status: 403 });
-
     const url = new URL(req.url);
     const claims = await readPayload(env, url.searchParams.get("token"));
+    var closed = await assertSubmissionOpen(env, !!(claims && claims.grant));
+    if (closed) return new Response(closed, { status: 403 });
     if (!claims || claims.scope !== "upload" || !claims.key) {
       return new Response("上传凭证无效或已过期", { status: 403 });
     }
@@ -1638,6 +1776,7 @@ async function handleAdmin(req, env) {
   var now = Date.now();
   var keys = await listGroupKeys(env);
   var nmap = await getNameMap(env);
+  var grants = await listGrants(env);
   var totalSize = 0, undownloadedSize = 0;
   var groupDataList = [];
   var allSids = new Set();
@@ -1707,6 +1846,42 @@ async function handleAdmin(req, env) {
   html += '<a class="toplink" href="/admin/names">👥 名单管理</a></nav>';
   html += '<p class="meta">当前后端：<b>' + escapeHtml(String(store.backend).toUpperCase() + (store.backend === 'b2' ? ' (Cloudflare 免流)' : '')) + '</b></p></header>';
   html += deadlineHtml;
+
+  var usableGrants = grants.filter(function (x) { return !x.used; });
+  html += '<section id="grants" class="glass card"><div class="section-head"><h2>🔑 临时提交凭证</h2><span class="pill">一次性</span></div>';
+  html += '<p class="meta" style="font-size:13px;color:#687892;margin:0 0 12px">截止后学生凭凭证可补交一次，提交成功即自动作废。凭证只是「绕过截止时间」，手动关闭提交时仍然拒绝。</p>';
+  html += '<form method="POST" action="/admin/grant-add" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">';
+  html += '<input type="hidden" name="token" value="' + at + '">';
+  html += '<input name="note" placeholder="备注（可选，如：张三补交）" style="flex:1;min-width:200px">';
+  html += '<button type="submit" class="btn btn-primary btn-xs">＋ 生成凭证</button></form>';
+  if (!grants.length) {
+    html += '<p class="meta" style="font-size:13px">暂无凭证，点上面按钮生成一个发给学生即可。</p>';
+  } else {
+    html += '<ul style="list-style:none;padding:0;margin:0;font-size:13px">';
+    for (var gi = 0; gi < grants.length; gi++) {
+      var gr = grants[gi];
+      var gid = escapeHtml(gr.id);
+      html += '<li style="padding:9px 0;border-top:1px solid var(--dash-border);display:flex;gap:8px;align-items:center;flex-wrap:wrap">';
+      html += '<code style="word-break:break-all;flex:1;min-width:220px">' + gid + '</code>';
+      html += gr.used
+        ? '<span style="color:#888;white-space:nowrap">已使用</span>'
+        : '<span style="color:#159a68;font-weight:700;white-space:nowrap">可用</span>';
+      html += '<button type="button" class="btn btn-ghost btn-xs" onclick="copyGrant(this,\'' + gid + '\')">复制</button>';
+      html += '<form method="POST" action="/admin/grant-delete" style="display:inline;margin:0">' +
+        '<input type="hidden" name="token" value="' + at + '">' +
+        '<input type="hidden" name="id" value="' + gid + '">' +
+        '<button type="submit" class="btn btn-danger-ghost btn-xs">删除</button></form>';
+      if (gr.note || gr.usedBy) {
+        html += '<span style="width:100%;color:#888;font-size:12px">' +
+          escapeHtml(gr.note ? '备注：' + gr.note : '') +
+          (gr.usedBy ? ' · 使用组：' + escapeHtml(gr.usedBy) : '') + '</span>';
+      }
+      html += '</li>';
+    }
+    html += '</ul>';
+  }
+  html += '<p class="meta" style="font-size:12px;margin-top:10px">当前可用 <b>' + usableGrants.length + '</b> 个，共 ' + grants.length + ' 个。</p></section>';
+
   html += '<div class="stat"><p>📊 已上传：' + fmt(totalSize) + ' | <b style="color:#c00">未下载：' + fmt(undownloadedSize) + '</b></p>';
   html += '<p>✅ 已交：' + allSids.size + ' 人 | ❌ 未交：' + missing.length + ' 人</p></div>';
   if (missing.length) {
@@ -1773,6 +1948,8 @@ async function handleAdmin(req, env) {
   var groupsJson = JSON.stringify(groupDataList.map(function (x) { return x.data.files || []; }))
   .replace(/</g, "\\u003c");
   html += '<script>';
+  html += 'function copyGrant(btn,id){var done=function(){btn.textContent="已复制";setTimeout(function(){btn.textContent="复制"},1500);};' +
+    'if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(id).then(done,function(){prompt("手动复制：",id)})}else{prompt("手动复制：",id)}}';
   html += 'var GROUPS=' + groupsJson + ';';
   html += 'var ADMIN_TOKEN="' + at + '";';
   html += 'function zBoxes(){return document.querySelectorAll(".zf");}';
